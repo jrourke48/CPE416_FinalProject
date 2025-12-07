@@ -118,6 +118,13 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': True}]
     )
+    dwa = Node(
+        package='lab4',
+        executable='DWA',
+        name='DWA',
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
 
 
     return LaunchDescription([
@@ -129,7 +136,8 @@ def generate_launch_description():
         robot_state_publisher,
         rviz_node,
         cmd_vel_arg,
-        roomba,
-        clearance,
-        cost
+        #roomba,
+        #clearance,
+        cost, 
+        dwa
     ])
