@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+install/
+log/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
