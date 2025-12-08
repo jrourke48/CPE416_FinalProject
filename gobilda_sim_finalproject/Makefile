@@ -16,7 +16,7 @@ bash:
 	docker run -it --name ${NAME} \
 	--net=ros \
 	--env="DISPLAY=novnc:0.0" \
-	-v ./:/gobilda_sim/:Z \
+	-v ./:/gobilda_sim_finalproject/:Z \
 	${IMAGE_NAME} \
 
 arch:

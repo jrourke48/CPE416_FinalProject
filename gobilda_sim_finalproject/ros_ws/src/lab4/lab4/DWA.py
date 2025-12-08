@@ -18,7 +18,7 @@ from typing import Optional, List, Tuple
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import TwistStamped, Pose
 from nav_msgs.msg import Odometry, OccupancyGrid
 
 
@@ -42,13 +42,13 @@ class DwaLocalPlannerNode(Node):
 
         # --- ROS interfaces ---
         # Publisher for velocity commands sent to the robot's motion controller
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_pub = self.create_publisher(TwistStamped, '/gobilda/cmd_vel', 10)
         
         # Subscriber for odometry data from KISS-ICP (provides robot pose and velocity estimates)
-        self.lidar_sub = self.create_subscription(
+        self.odom_sub = self.create_subscription(
             Odometry,
-            '/kiss/odometry',
-            self.lidar_callback,
+            '/odometry/filtered',
+            self.odom_callback,
             10
         )
         
@@ -56,14 +56,14 @@ class DwaLocalPlannerNode(Node):
         self.localcostmap_sub = self.create_subscription(
             OccupancyGrid,
             '/map',
-            self.localcostmap_callback,
+            self.local_costmap_callback,
             10
         )
         
         # --- Robot state variables ---
         # Goal state: (x, y, yaw, linear_velocity, angular_velocity) in world frame
         # Currently hard-coded; in a full system this would come from a global planner
-        self.goal_state = (2, 0, 0, 0, 0)  # Target: x=2m, y=0m, no specific orientation/velocity
+        self.goal_state = (4, 0, 0, 0, 0)  # Target: x=4m, y=0m, no specific orientation/velocity
         
         # Current robot state: (x, y, yaw, linear_velocity, angular_velocity)
         # Updated continuously from odometry messages
@@ -104,17 +104,18 @@ class DwaLocalPlannerNode(Node):
         # Number of angular velocity samples to evaluate in the dynamic window
         # More samples allow better turning maneuvers but increase computation
         self.vtheta_samples = 20
+        self.count = 0
         
         # --- DWA cost function weights ---
         # These weights balance different objectives in trajectory evaluation
         # Higher weight means that objective is more important in decision making
         
         # Weight for heading cost - rewards trajectories that end closer to the goal
-        self.heading_weight = 1.0
+        self.heading_weight = 8.0
         
         # Weight for obstacle cost - penalizes trajectories that get too close to obstacles
         # Higher value makes robot more conservative around obstacles
-        self.obstacle_weight = 1.5
+        self.obstacle_weight = 4.0
         
         # Weight for velocity cost - rewards maintaining higher forward velocity
         # Encourages efficient motion when safe to do so
@@ -128,7 +129,7 @@ class DwaLocalPlannerNode(Node):
 
     # ----------------- Callbacks -----------------
 
-    def lidar_callback(self, msg: Odometry):
+    def odom_callback(self, msg: Odometry):
         """
         Process incoming odometry messages from KISS-ICP lidar-based localization.
 
@@ -159,6 +160,11 @@ class DwaLocalPlannerNode(Node):
 
         # Update the current robot state tuple used by the DWA planner
         # Format: (x_position, y_position, heading_angle, forward_velocity, rotation_rate)
+        # if self.count >= 10:
+        #     self.get_logger().info(f'Odometry received: x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}')
+        #     self.count = 0
+        # else:
+        #     self.count += 1
         self.current_state = (x, y, yaw, vx, vyaw)
 
     def local_costmap_callback(self, msg: OccupancyGrid):
@@ -189,12 +195,26 @@ class DwaLocalPlannerNode(Node):
         """
         # Safety check: ensure we have received odometry data before planning
         # Without odometry, we don't know the robot's current state
-        if self.latest_odometry is None:
-            return
+        # if self.latest_odometry is None:
+        #     return
         
         # Safety check: ensure we have received costmap data before planning
         # Without a costmap, we cannot evaluate trajectory safety
         if self.latest_local_costmap is None:
+            return
+
+        # Check if goal is reached - stop if within tolerance
+        x, y, _, _, _ = self.current_state
+        gx, gy, _, _, _ = self.goal_state
+        dist_to_goal = math.hypot(gx - x, gy - y)
+        
+        if dist_to_goal < 0.2:  # 20cm tolerance
+            # Publish stop command
+            cmd = TwistStamped()
+            cmd.twist.linear.x = 0.0
+            cmd.twist.angular.z = 0.0
+            self.cmd_pub.publish(cmd)
+            self.get_logger().info('Goal reached! Stopping.')
             return
 
         # Run the DWA algorithm to compute the best velocity command
@@ -204,6 +224,11 @@ class DwaLocalPlannerNode(Node):
             goal=self.goal_state,
             costmap=self.latest_local_costmap
         )
+        if self.count >= 10:
+            self.get_logger().info(f'velocity commands: dx={cmd.twist.linear.x:.2f}, dyaw={cmd.twist.angular.z:.2f}')
+            self.count = 0
+        else:
+            self.count += 1
 
         # Publish the computed velocity command to the robot's controller
         # The command will be executed until the next control cycle
@@ -228,10 +253,11 @@ class DwaLocalPlannerNode(Node):
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
+    
     def compute_next_velo(self,
                     state: Tuple[float, float, float, float, float],
                     goal: Tuple[float, float, float, float, float],
-                    costmap: OccupancyGrid) -> Twist:
+                    costmap: OccupancyGrid) -> TwistStamped:
         """
         Execute the complete DWA algorithm to find the optimal velocity command.
         
@@ -248,7 +274,7 @@ class DwaLocalPlannerNode(Node):
         @param state Current robot state: (x, y, yaw, linear_vel, angular_vel)
         @param goal Target goal state: (x, y, yaw, linear_vel, angular_vel)
         @param costmap OccupancyGrid containing obstacle information
-        @return Twist message with optimal linear and angular velocity commands
+        @return TwistStamped message with optimal linear and angular velocity commands
         """
         # Step 1: Compute the dynamic window - the set of velocities reachable in one timestep
         # This considers both absolute velocity limits and what's achievable given current velocity
@@ -264,7 +290,7 @@ class DwaLocalPlannerNode(Node):
 
         # Initialize tracking variables for the best trajectory found
         best_score = -float('inf')  # Start with worst possible score
-        best_cmd = Twist()          # Default to zero velocity if no good option found
+        best_cmd = TwistStamped()          # Default to zero velocity if no good option found
 
         # Step 4 & 5: Evaluate each velocity sample by simulating and scoring its trajectory
         for v, w in samples:
@@ -282,8 +308,8 @@ class DwaLocalPlannerNode(Node):
             # Higher scores are better (rewards good behavior, penalizes bad behavior)
             if score > best_score:
                 best_score = score
-                best_cmd.linear.x = v   # Store the linear velocity command
-                best_cmd.angular.z = w  # Store the angular velocity command
+                best_cmd.twist.linear.x = v   # Store the linear velocity command
+                best_cmd.twist.angular.z = w  # Store the angular velocity command
 
         # Return the velocity command that produced the best-scoring trajectory
         return best_cmd
@@ -580,7 +606,7 @@ class DwaLocalPlannerNode(Node):
         # Check for collision: if trajectory passes too close to an obstacle,
         # mark it as completely invalid by returning negative infinity
         # This ensures collision trajectories are never selected, regardless of other costs
-        collision_threshold = 0.1  # meters - tune based on robot size and safety requirements
+        collision_threshold = 0.30  # meters - tune based on robot size and safety requirements
         if min_dist < collision_threshold:
             return -float('inf')  # Invalid trajectory - would cause collision
 
